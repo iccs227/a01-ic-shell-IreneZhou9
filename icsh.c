@@ -12,6 +12,8 @@
 #include <limits.h>    // for PATH_MAX
 #include <errno.h>
 #include <stdbool.h>
+#include <sys/types.h>   // for pid_t
+#include <sys/wait.h>    // for waitpid()
 
 
 #define BUFSIZE 1024
@@ -140,9 +142,45 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        // Unknown
-        printf("bad command\n");
-        last_status = 1;
+        // Milestone 3: external command handling
+        {
+            // Split cmd into argv array
+            char *argv_exec[BUFSIZE/2];
+            int argc_exec = 0;
+            char *token = strtok(cmd, " ");
+            while (token && argc_exec < (BUFSIZE/2 - 1)) {
+                argv_exec[argc_exec++] = token;
+                token = strtok(NULL, " ");
+            }
+            argv_exec[argc_exec] = NULL;
+
+            pid_t pid = fork();
+            if (pid < 0) {
+                // fork failed
+                perror("fork");
+                last_status = 1;
+            }
+            else if (pid == 0) {
+                // child: execute external program
+                execvp(argv_exec[0], argv_exec);
+                // if execvp returns, there was an error
+                perror(argv_exec[0]);  // e.g. "ls: No such file or directory"
+                exit(1);
+            }
+            else {
+                // parent: wait for child to finish
+                int wstatus;
+                if (waitpid(pid, &wstatus, 0) == -1) {
+                    perror("waitpid");
+                    last_status = 1;
+                } else if (WIFEXITED(wstatus)) {
+                    last_status = WEXITSTATUS(wstatus);
+                } else {
+                    last_status = 1;
+                }
+            }
+        }
+        continue;  // after external, loop back
     }
 
     // end-of-file reached
