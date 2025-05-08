@@ -3,7 +3,6 @@
  * StudentID: u6580536
  */
 
-/* icsh.c – Milestone 1 */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,11 +13,32 @@
 #include <stdbool.h>
 #include <sys/types.h>   // for pid_t
 #include <sys/wait.h>    // for waitpid()
+#include <signal.h> 
 
 
 #define BUFSIZE 1024
 
+// track the current foreground child PID
+static pid_t fg_pid = 0;
+
+// Milestone 4: SIGINT handler (Ctrl-C)
+void handle_sigint(int sig) {
+    if (fg_pid > 0) {
+        kill(fg_pid, SIGINT);
+    }
+}
+
+// Milestone 4: SIGTSTP handler (Ctrl-Z)
+void handle_sigtstp(int sig) {
+    if (fg_pid > 0) {
+        kill(fg_pid, SIGTSTP);
+    }
+}
+
 int main(int argc, char *argv[]) {
+    signal(SIGINT,  handle_sigint);
+    signal(SIGTSTP, handle_sigtstp);
+
     FILE *in = stdin;
     bool script = false;
     int last_status = 0;
@@ -161,26 +181,35 @@ int main(int argc, char *argv[]) {
                 last_status = 1;
             }
             else if (pid == 0) {
-                // child: execute external program
+                // child resets signals to default
+                signal(SIGINT,  SIG_DFL);
+                signal(SIGTSTP, SIG_DFL);
                 execvp(argv_exec[0], argv_exec);
-                // if execvp returns, there was an error
-                perror(argv_exec[0]);  // e.g. "ls: No such file or directory"
+                perror(argv_exec[0]);
                 exit(1);
             }
             else {
-                // parent: wait for child to finish
-                int wstatus;
-                if (waitpid(pid, &wstatus, 0) == -1) {
+                // Milestone 4: record & wait for foreground job
+                fg_pid = pid;  
+                int wstat;
+                if (waitpid(pid, &wstat, WUNTRACED) == -1) {
                     perror("waitpid");
                     last_status = 1;
-                } else if (WIFEXITED(wstatus)) {
-                    last_status = WEXITSTATUS(wstatus);
-                } else {
-                    last_status = 1;
                 }
+                else if (WIFEXITED(wstat)) {
+                    last_status = WEXITSTATUS(wstat);
+                }
+                else if (WIFSIGNALED(wstat)) {
+                    // child was killed by a signal (e.g. SIGINT)
+                    last_status = 128 + WTERMSIG(wstat);
+                }
+                else if (WIFSTOPPED(wstat)) {
+                    last_status = 128 + WSTOPSIG(wstat);
+                }
+                fg_pid = 0;    // clear foreground pid
             }
         }
-        continue;  // after external, loop back
+        continue;
     }
 
     // end-of-file reached
