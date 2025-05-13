@@ -14,6 +14,7 @@
 #include <sys/types.h>   // for pid_t
 #include <sys/wait.h>    // for waitpid()
 #include <signal.h> 
+#include <fcntl.h> 
 
 
 #define BUFSIZE 1024
@@ -162,7 +163,7 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        // Milestone 3: external command handling
+        // Milestone 3-5: external command handling + I/O redirection + signals
         {
             // Split cmd into argv array
             char *argv_exec[BUFSIZE/2];
@@ -171,6 +172,24 @@ int main(int argc, char *argv[]) {
             while (token && argc_exec < (BUFSIZE/2 - 1)) {
                 argv_exec[argc_exec++] = token;
                 token = strtok(NULL, " ");
+            }
+            argv_exec[argc_exec] = NULL;
+
+            // Milestone 5: detect < and >, remove them
+            char *in_file = NULL, *out_file = NULL;
+            for (int i = 0; i < argc_exec; i++) {
+                if (strcmp(argv_exec[i], "<") == 0 && i+1 < argc_exec) {
+                    in_file = argv_exec[i+1];
+                    memmove(&argv_exec[i], &argv_exec[i+2],
+                            sizeof(char*)*(argc_exec - i - 1));
+                    argc_exec -= 2;  i--;
+                }
+                else if (strcmp(argv_exec[i], ">") == 0 && i+1 < argc_exec) {
+                    out_file = argv_exec[i+1];
+                    memmove(&argv_exec[i], &argv_exec[i+2],
+                            sizeof(char*)*(argc_exec - i - 1));
+                            argc_exec -= 2;  i--;
+                }
             }
             argv_exec[argc_exec] = NULL;
 
@@ -184,6 +203,23 @@ int main(int argc, char *argv[]) {
                 // child resets signals to default
                 signal(SIGINT,  SIG_DFL);
                 signal(SIGTSTP, SIG_DFL);
+
+                // Milestone 5: input redirection
+                if (in_file) {
+                    int fd = open(in_file, O_RDONLY);
+                    if (fd < 0) { perror(in_file); exit(1); }
+                    dup2(fd, STDIN_FILENO);
+                    close(fd);
+                }
+                // Milestone 5: output redirection
+                if (out_file) {
+                    int fd = open(out_file,
+                                  O_WRONLY|O_CREAT|O_TRUNC, 0666);
+                    if (fd < 0) { perror(out_file); exit(1); }
+                    dup2(fd, STDOUT_FILENO);
+                    close(fd);
+                }
+
                 execvp(argv_exec[0], argv_exec);
                 perror(argv_exec[0]);
                 exit(1);
