@@ -11,41 +11,165 @@
 #include <limits.h>    // for PATH_MAX
 #include <errno.h>
 #include <stdbool.h>
-#include <sys/types.h>   // for pid_t
-#include <sys/wait.h>    // for waitpid()
-#include <signal.h> 
-#include <fcntl.h> 
-
+#include <sys/types.h>   // pid_t
+#include <sys/wait.h>    // waitpid(), WIFEXITED, WNOHANG
+#include <signal.h>      // signal handling
+#include <fcntl.h>       // open(), O_RDONLY, O_CREAT, etc.
 
 #define BUFSIZE 1024
+#define MAXJOBS 128
 
-// track the current foreground child PID
-static pid_t fg_pid = 0;
+// job struct for background jobs
+typedef struct {
+    int    jid;          // job ID [1] [2] etc
+    pid_t  pid;          // process ID
+    int    state;        // Job state: RUNNING, STOPPED
+    char   *cmdline;     // command line
+} job_t;
 
-// Milestone 4: SIGINT handler (Ctrl-C)
-void handle_sigint(int sig) {
-    if (fg_pid > 0) {
-        kill(fg_pid, SIGINT);
+// Job states
+#define UNDEF 0    // undefined
+#define RUNNING 1   // running
+#define STOPPED 2   // stopped
+
+static job_t jobs[MAXJOBS];  // job list
+static int nextjid = 1;      // next job ID to allocate
+static int fg_pid = 0;       // current foreground job pid
+
+// Store the current command being executed
+static char current_cmd[BUFSIZE];
+
+// Function prototypes
+static void initjobs(job_t *jobs);
+static int addjob(job_t *jobs, pid_t pid, int state, char *cmdline);
+static int deletejob(job_t *jobs, pid_t pid);
+static job_t *getjobpid(job_t *jobs, pid_t pid);
+static job_t *getjobjid(job_t *jobs, int jid);
+
+// Initialize the job list
+static void initjobs(job_t *jobs) {
+    for (int i = 0; i < MAXJOBS; i++) {
+        jobs[i].jid = 0;
+        jobs[i].pid = 0;
+        jobs[i].state = UNDEF;
+        jobs[i].cmdline = NULL;
     }
 }
 
-// Milestone 4: SIGTSTP handler (Ctrl-Z)
+// Add a job to the job list
+static int addjob(job_t *jobs, pid_t pid, int state, char *cmdline) {
+    if (pid < 1) return 0;
+    
+    for (int i = 0; i < MAXJOBS; i++) {
+        if (jobs[i].pid == 0) {
+            jobs[i].pid = pid;
+            jobs[i].state = state;
+            jobs[i].jid = nextjid++;
+            jobs[i].cmdline = strdup(cmdline);
+            return 1;
+        }
+    }
+    return 0;  // job list is full
+}
+
+// Delete a job from the job list
+static int deletejob(job_t *jobs, pid_t pid) {
+    if (pid < 1) return 0;
+    
+    for (int i = 0; i < MAXJOBS; i++) {
+        if (jobs[i].pid == pid) {
+            free(jobs[i].cmdline);
+            jobs[i].pid = 0;
+            jobs[i].jid = 0;
+            jobs[i].state = UNDEF;
+            jobs[i].cmdline = NULL;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Find a job by pid
+static job_t *getjobpid(job_t *jobs, pid_t pid) {
+    if (pid < 1) return NULL;
+    for (int i = 0; i < MAXJOBS; i++)
+        if (jobs[i].pid == pid)
+            return &jobs[i];
+    return NULL;
+}
+
+// Find a job by jid
+static job_t *getjobjid(job_t *jobs, int jid) {
+    if (jid < 1) return NULL;
+    for (int i = 0; i < MAXJOBS; i++)
+        if (jobs[i].jid == jid)
+            return &jobs[i];
+    return NULL;
+}
+
+// Signal handlers
+void handle_sigchld(int sig) {
+    int status;
+    pid_t pid;
+    
+    while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
+        job_t *job = getjobpid(jobs, pid);
+        if (!job) continue;
+        
+        if (WIFSTOPPED(status)) {
+            job->state = STOPPED;
+            char msg[100];
+            int len = snprintf(msg, sizeof(msg), "\n[%d]+ Stopped                 %s\n", job->jid, job->cmdline);
+            write(STDOUT_FILENO, msg, len);
+            if (pid == fg_pid) {
+                fg_pid = 0;
+                write(STDOUT_FILENO, "icsh $ ", 7);
+            }
+        }
+        else if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            if (job->state == RUNNING && !fg_pid) {  // Only print for background jobs
+                char msg[100];
+                int len = snprintf(msg, sizeof(msg), "[%d]+ Done                    %s\n", job->jid, job->cmdline);
+                write(STDOUT_FILENO, msg, len);
+            }
+            deletejob(jobs, pid);
+            if (pid == fg_pid) {
+                fg_pid = 0;
+            }
+        }
+    }
+}
+
 void handle_sigtstp(int sig) {
     if (fg_pid > 0) {
-        kill(fg_pid, SIGTSTP);
+        kill(-fg_pid, SIGTSTP);  // Send SIGTSTP to the entire process group
+    }
+}
+
+void handle_sigint(int sig) {
+    if (fg_pid > 0) {
+        kill(-fg_pid, SIGINT);  // Send SIGINT to the entire process group
+    } else {
+        write(STDOUT_FILENO, "\nicsh $ ", 8);
     }
 }
 
 int main(int argc, char *argv[]) {
-    signal(SIGINT,  handle_sigint);
+    // Initialize signal handlers
+    signal(SIGINT, handle_sigint);
     signal(SIGTSTP, handle_sigtstp);
-
+    signal(SIGCHLD, handle_sigchld);
+    
+    // Initialize job list
+    initjobs(jobs);
+    
     FILE *in = stdin;
     bool script = false;
     int last_status = 0;
 
     char line[BUFSIZE];
     char last_cmd[BUFSIZE] = "";   // store last non-!! command
+    char *cmd;                     // pointer to the current command string
 
     // --- Milestone 2: detect script mode ---
     if (argc == 2) {
@@ -75,7 +199,6 @@ int main(int argc, char *argv[]) {
         if (!fgets(line, BUFSIZE, in))
             break;                // EOF
 
-        // Strip newline
         line[strcspn(line, "\n")] = '\0';
 
         // Skip empty lines
@@ -84,9 +207,7 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        char *cmd = line;
-
-        // “!!”: repeat last command, but only echo it in interactive mode
+        // "!!": repeat last command, but only echo it in interactive mode
         if (strcmp(line, "!!") == 0) {
             if (last_cmd[0] == '\0') {
                 last_status = 0;
@@ -96,12 +217,15 @@ int main(int argc, char *argv[]) {
                 printf("%s\n", last_cmd);
             }
             cmd = last_cmd;
+            strncpy(current_cmd, last_cmd, BUFSIZE-1);
+            current_cmd[BUFSIZE-1] = '\0';
         } else {
             strncpy(last_cmd, line, BUFSIZE-1);
             last_cmd[BUFSIZE-1] = '\0';
+            cmd = line;
+            strncpy(current_cmd, line, BUFSIZE-1);
+            current_cmd[BUFSIZE-1] = '\0';
         }
-
-
 
         // Built-in: echo
         if (strncmp(cmd, "echo", 4) == 0 &&
@@ -123,10 +247,21 @@ int main(int argc, char *argv[]) {
             (cmd[4] == ' ' || cmd[4] == '\0')) 
         {
             int code = 0;
-            if (cmd[4] == ' ') 
-                code = atoi(cmd + 5) & 0xFF;
+            char *arg = cmd + 4;
+            while (*arg == ' ') arg++;  // skip spaces
+            if (*arg != '\0') {
+                code = atoi(arg) & 0xFF;
+            }
             if (!script) {
-                    printf("bye\n");
+                printf("bye\n");
+            }
+            // Kill all remaining jobs before exiting
+            for (int i = 0; i < MAXJOBS; i++) {
+                if (jobs[i].pid != 0) {
+                    kill(-jobs[i].pid, SIGKILL);
+                    waitpid(jobs[i].pid, NULL, 0);  // Wait for the process to die
+                    deletejob(jobs, jobs[i].pid);
+                }
             }
             exit(code);
         }
@@ -163,86 +298,191 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        // Milestone 3-5: external command handling + I/O redirection + signals
-        {
-            // Split cmd into argv array
-            char *argv_exec[BUFSIZE/2];
-            int argc_exec = 0;
-            char *token = strtok(cmd, " ");
-            while (token && argc_exec < (BUFSIZE/2 - 1)) {
-                argv_exec[argc_exec++] = token;
-                token = strtok(NULL, " ");
+        // Built-in: jobs
+        if (strcmp(cmd, "jobs") == 0) {
+            for (int i = 0; i < MAXJOBS; i++) {
+                if (jobs[i].pid != 0) {
+                    printf("[%d]%c %-20s %s%s\n", 
+                        jobs[i].jid,
+                        (jobs[i].jid == nextjid-1) ? '+' : '-',
+                        jobs[i].state == RUNNING ? "Running" : "Stopped",
+                        jobs[i].cmdline,
+                        jobs[i].state == RUNNING ? " &" : "");
+                }
             }
-            argv_exec[argc_exec] = NULL;
+            last_status = 0; 
+            continue;
+        }
 
-            // Milestone 5: detect < and >, remove them
-            char *in_file = NULL, *out_file = NULL;
-            for (int i = 0; i < argc_exec; i++) {
-                if (strcmp(argv_exec[i], "<") == 0 && i+1 < argc_exec) {
-                    in_file = argv_exec[i+1];
-                    memmove(&argv_exec[i], &argv_exec[i+2],
-                            sizeof(char*)*(argc_exec - i - 1));
-                    argc_exec -= 2;  i--;
-                }
-                else if (strcmp(argv_exec[i], ">") == 0 && i+1 < argc_exec) {
-                    out_file = argv_exec[i+1];
-                    memmove(&argv_exec[i], &argv_exec[i+2],
-                            sizeof(char*)*(argc_exec - i - 1));
-                            argc_exec -= 2;  i--;
+        // Built-in: bg %<job_id> — resume a stopped job in the background
+        if (strncmp(cmd, "bg", 2) == 0 &&
+            (cmd[2] == ' ' || cmd[2] == '\0'))
+        {
+            char *arg = cmd + 2;         // skip "bg"
+            while (*arg == ' ') arg++;   // skip spaces
+            if (*arg == '\0') {
+                fprintf(stderr, "bg: usage: bg %%<job_id>\n");
+                last_status = 1;
+                continue;
+            }
+            if (*arg == '%') arg++;      // skip the '%'
+            int jid = atoi(arg);         // job-id to resume
+            if (jid <= 0) {
+                fprintf(stderr, "bg: invalid job id: %s\n", arg);
+                last_status = 1;
+                continue;
+            }
+            job_t *job = getjobjid(jobs, jid);
+            if (!job) {
+                fprintf(stderr, "bg: %%%d: no such job\n", jid);
+                last_status = 1;
+                continue;
+            }
+            
+            if (kill(-job->pid, SIGCONT) < 0) {
+                perror("kill (SIGCONT)");
+                last_status = 1;
+                continue;
+            }
+            
+            job->state = RUNNING;
+            printf("[%d]+ %s &\n", job->jid, job->cmdline);
+            continue;
+        }
+
+        // Built-in: fg %<job_id> — bring a background job to foreground
+        if (strncmp(cmd, "fg", 2) == 0 &&
+            (cmd[2] == ' ' || cmd[2] == '\0'))
+        {
+            char *arg = cmd + 2;         // skip "fg"
+            while (*arg == ' ') arg++;   // skip spaces
+            if (*arg == '\0') {
+                fprintf(stderr, "fg: usage: fg %%<job_id>\n");
+                last_status = 1;
+                continue;
+            }
+            if (*arg == '%') arg++;      // skip the '%'
+            int jid = atoi(arg);         // job-id to foreground
+            job_t *job = getjobjid(jobs, jid);
+            if (!job) {
+                fprintf(stderr, "fg: %%%d: no such job\n", jid);
+                last_status = 1;
+                continue;
+            }
+            
+            // Store command before potentially removing job
+            char cmd_copy[BUFSIZE];
+            strncpy(cmd_copy, job->cmdline, BUFSIZE-1);
+            cmd_copy[BUFSIZE-1] = '\0';
+            
+            if (kill(-job->pid, SIGCONT) < 0) {
+                perror("kill (SIGCONT)");
+                last_status = 1;
+                continue;
+            }
+            
+            job->state = RUNNING;
+            fg_pid = job->pid;
+            printf("%s\n", cmd_copy);
+            
+            int status;
+            if (waitpid(job->pid, &status, WUNTRACED) < 0) {
+                if (errno != ECHILD) {  // Ignore "No child processes" error
+                    perror("waitpid");
                 }
             }
-            argv_exec[argc_exec] = NULL;
+            
+            if (WIFSTOPPED(status)) {
+                job->state = STOPPED;
+            } else {
+                deletejob(jobs, job->pid);
+                fg_pid = 0;
+            }
+            continue;
+        }
+
+        // Handle regular command execution
+        else {
+            bool is_bg = false;
+            size_t cmdlen = strlen(cmd);
+            if (cmdlen > 0 && cmd[cmdlen-1] == '&') {
+                is_bg = true;
+                cmd[cmdlen-1] = '\0';  // Remove &
+                while (cmdlen > 1 && cmd[cmdlen-2] == ' ') {
+                    cmd[cmdlen-2] = '\0';
+                    cmdlen--;
+                }
+            }
 
             pid_t pid = fork();
             if (pid < 0) {
-                // fork failed
                 perror("fork");
-                last_status = 1;
+                continue;
             }
-            else if (pid == 0) {
-                // child resets signals to default
-                signal(SIGINT,  SIG_DFL);
+            else if (pid == 0) {  // Child
+                // Create new process group
+                if (setpgid(0, 0) < 0) {
+                    perror("setpgid");
+                    exit(1);
+                }
+                
+                // Reset signal handlers to default in child
+                signal(SIGINT, SIG_DFL);
                 signal(SIGTSTP, SIG_DFL);
-
-                // Milestone 5: input redirection
-                if (in_file) {
-                    int fd = open(in_file, O_RDONLY);
-                    if (fd < 0) { perror(in_file); exit(1); }
-                    dup2(fd, STDIN_FILENO);
-                    close(fd);
+                signal(SIGCHLD, SIG_DFL);
+                signal(SIGCONT, SIG_DFL);
+                signal(SIGTTIN, SIG_DFL);
+                signal(SIGTTOU, SIG_DFL);
+                
+                // Parse command into arguments
+                char *argv[BUFSIZE/2];
+                int argc = 0;
+                char *token = strtok(cmd, " \t");
+                while (token && argc < (BUFSIZE/2 - 1)) {
+                    argv[argc++] = token;
+                    token = strtok(NULL, " \t");
                 }
-                // Milestone 5: output redirection
-                if (out_file) {
-                    int fd = open(out_file,
-                                  O_WRONLY|O_CREAT|O_TRUNC, 0666);
-                    if (fd < 0) { perror(out_file); exit(1); }
-                    dup2(fd, STDOUT_FILENO);
-                    close(fd);
-                }
-
-                execvp(argv_exec[0], argv_exec);
-                perror(argv_exec[0]);
+                argv[argc] = NULL;
+                
+                execvp(argv[0], argv);
+                perror(argv[0]);  // Only reaches here if exec fails
                 exit(1);
             }
-            else {
-                // Milestone 4: record & wait for foreground job
-                fg_pid = pid;  
-                int wstat;
-                if (waitpid(pid, &wstat, WUNTRACED) == -1) {
-                    perror("waitpid");
-                    last_status = 1;
+            else {  // Parent
+                // Put child in its own process group
+                if (setpgid(pid, pid) < 0) {
+                    // Ignore race condition error
+                    if (errno != EACCES) {
+                        perror("setpgid");
+                    }
                 }
-                else if (WIFEXITED(wstat)) {
-                    last_status = WEXITSTATUS(wstat);
+                
+                if (is_bg) {
+                    // Add to job list and print job info
+                    addjob(jobs, pid, RUNNING, cmd);
+                    printf("[%d] %d\n", nextjid-1, pid);
                 }
-                else if (WIFSIGNALED(wstat)) {
-                    // child was killed by a signal (e.g. SIGINT)
-                    last_status = 128 + WTERMSIG(wstat);
+                else {
+                    // Foreground process
+                    fg_pid = pid;
+                    strcpy(current_cmd, cmd);
+                    
+                    int status;
+                    if (waitpid(pid, &status, WUNTRACED) < 0) {
+                        if (errno != ECHILD) {  // Ignore "No child processes" error
+                            perror("waitpid");
+                        }
+                    }
+                    
+                    if (WIFSTOPPED(status)) {
+                        // Job was stopped (Ctrl+Z)
+                        addjob(jobs, pid, STOPPED, cmd);
+                    }
+                    else {
+                        // Job completed or was killed
+                        fg_pid = 0;
+                    }
                 }
-                else if (WIFSTOPPED(wstat)) {
-                    last_status = 128 + WSTOPSIG(wstat);
-                }
-                fg_pid = 0;    // clear foreground pid
             }
         }
         continue;

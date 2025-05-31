@@ -1,0 +1,9 @@
+Makefile
+README.md
+fruits.txt
+icsh
+icsh.c
+icsh.dSYM
+list.txt
+name.c
+test.sh
